@@ -4,6 +4,7 @@ import threading
 import os
 from pathlib import Path
 import sys
+import re
 
 if getattr(sys, 'frozen', False):
     base_dir = Path(sys.executable).resolve().parent
@@ -22,6 +23,30 @@ scripts_dir = base_dir / "Scripts"
 LinkCopier = scripts_dir / "LinkCopier" / "LinkCopier.py"
 YoutubeDownloader = scripts_dir / "YoutubeDownloader" / "YoutubeDownloader.py"
 VidHandler = scripts_dir / "VidHandler" / "VidHandler.py"
+
+def parse_to_bytes(s):
+    m = re.search(r'([\d.]+)([KkMmGgTt]?i?B)?', s)
+    if not m: return 0.0
+    val = float(m.group(1))
+    unit = (m.group(2) or '').upper()
+    mult = 1
+    if 'K' in unit: mult = 1024
+    elif 'M' in unit: mult = 1024 * 1024
+    elif 'G' in unit: mult = 1024 * 1024 * 1024
+    elif 'T' in unit: mult = 1024 * 1024 * 1024 * 1024
+    return val * mult
+
+def format_size(bytes_val):
+    if bytes_val < 1024 * 1024:
+        return f"{bytes_val / 1024:.1f}KB"
+    else:
+        return f"{bytes_val / (1024 * 1024):.1f}MB"
+
+def format_speed(bytes_per_sec):
+    if bytes_per_sec < 1024 * 1024:
+        return f"{bytes_per_sec / 1024:.1f}KB/s"
+    else:
+        return f"{bytes_per_sec / (1024 * 1024):.1f}MB/s"
 
 class TerminalGUI(ctk.CTk):
     def __init__(self):
@@ -42,6 +67,7 @@ class TerminalGUI(ctk.CTk):
         
         self.current_page = "Page 1"
         self.last_mtimes = {"left": 0, "right": 0}
+        self.is_progress_line_active = False
 
         self.grid_columnconfigure(0, weight=1) 
         self.grid_columnconfigure(1, weight=2)
@@ -71,7 +97,7 @@ class TerminalGUI(ctk.CTk):
         # 2. The Right Editor
         self.editor_right = ctk.CTkTextbox(self.content_container)
         self.editor_right.bind("<KeyRelease>", lambda e: self.save_content(self.editor_right, self.pages[self.current_page]["right"], "right"))
-        
+
         # --- BUTTONS ---
         self.action_frame = ctk.CTkFrame(self.bottom_container, fg_color="transparent")
         self.action_frame.pack(fill="x", pady=(0, 5))
@@ -85,8 +111,16 @@ class TerminalGUI(ctk.CTk):
         for page_name in self.pages.keys():
             ctk.CTkButton(self.page_nav_frame, text=page_name, command=lambda p=page_name: self.switch_page(p)).pack(side="left", pady=5, padx=5, expand=True, fill="x")
 
-        self.refresh_btn = ctk.CTkButton(self.page_nav_frame, text="Refresh/Sync")
-        self.refresh_btn.pack(side="left", pady=5, padx=5, expand=True, fill="x")
+        # --- QUALITY SELECTOR FRAME ---
+        self.quality_var = ctk.StringVar(value="360p")
+        self.quality_dropdown = ctk.CTkComboBox(
+            self.page_nav_frame,
+            values=["144p", "360p", "480p", "720p", "1080p"],
+            variable=self.quality_var,
+            state="readonly",
+            width=85
+        )
+        self.quality_dropdown.pack(side="left", padx=5)
 
         self.switch_page("Page 1")
         self.monitor_file()
@@ -142,9 +176,16 @@ class TerminalGUI(ctk.CTk):
                 f.write(widget.get("1.0", "end-1c"))
             self.last_mtimes[key] = os.path.getmtime(path)
 
-    def append_output(self, text):
+    def append_or_update_progress(self, text, is_progress=False):
         self.terminal.configure(state="normal")
-        self.terminal.insert("end", text)
+        if is_progress:
+            if self.is_progress_line_active:
+                self.terminal.delete("end-2l", "end-1c")
+            self.terminal.insert("end", text + "\n")
+            self.is_progress_line_active = True
+        else:
+            self.terminal.insert("end", text)
+            self.is_progress_line_active = False
         self.terminal.see("end")
         self.terminal.configure(state="disabled")
 
@@ -157,10 +198,16 @@ class TerminalGUI(ctk.CTk):
         self.terminal.configure(state="normal")
         self.terminal.delete("1.0", "end")
         self.terminal.configure(state="disabled")
+        self.is_progress_line_active = False
         
-        threading.Thread(target=self.run_script, args=(script_path,), daemon=True).start()
+        # Collect extra arguments if running the YouTube Downloader
+        extra_args = []
+        if script_path == YoutubeDownloader:
+            extra_args = [self.quality_var.get()]
+            
+        threading.Thread(target=self.run_script, args=(script_path, extra_args), daemon=True).start()
 
-    def run_script(self, script_path):
+    def run_script(self, script_path, extra_args=[]):
         my_env = os.environ.copy()
         my_env["FORCE_TERMINAL"] = "1"
         my_env["FORCE_COLOR"] = "1"
@@ -169,9 +216,9 @@ class TerminalGUI(ctk.CTk):
         startup_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         
         try:
-            # Explicitly use the bundled Runtime python executable instead of global "python"
+            cmd = [str(python_executable), str(script_path)] + extra_args
             process = subprocess.Popen(
-                [str(python_executable), str(script_path)],  
+                cmd,  
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
                 text=True, 
@@ -180,15 +227,82 @@ class TerminalGUI(ctk.CTk):
                 creationflags=startup_flags
             )
             
+            stream_type = "Video"
+            download_count = 0
+
             for line in process.stdout:
-                clean_line = line.replace('\r', '\n')
-                self.after(0, lambda l=clean_line: self.append_output(l))
+                clean_line = line.replace('\r', '').strip()
+                if not clean_line:
+                    continue
+                
+                # --- SUPPRESSIONS & TRACKING ---
+                if clean_line.startswith("Downloading:"):
+                    download_count = 0
+                    stream_type = "Video"
+                    self.after(0, lambda l=clean_line: self.append_or_update_progress(l + "\n", is_progress=False))
+                    continue
+
+                if any(tag in clean_line for tag in ["[youtube]", "[info]", "[debug]"]):
+                    continue
+
+                # Catch "Already Downloaded" messages
+                if "has already been downloaded" in clean_line:
+                    match = re.search(r'\[download\]\s+(.*?)\s+has already been downloaded', clean_line)
+                    if match:
+                        file_path = match.group(1).strip()
+                        file_name = os.path.basename(file_path)
+                        friendly_msg = f"[ {file_name} ] Is already downloaded\n"
+                        self.after(0, lambda m=friendly_msg: self.append_or_update_progress(m, is_progress=False))
+                    continue
+
+                # Persist video bar right before switching to audio (without an extra empty line)
+                if "[download] Destination:" in clean_line:
+                    if self.is_progress_line_active:
+                        self.is_progress_line_active = False
+                    
+                    download_count += 1
+                    stream_type = "Audio" if download_count >= 2 else "Video"
+                    continue
+
+                if "[Merger]" in clean_line:
+                    self.after(0, lambda: self.append_or_update_progress("Merging video and audio streams into final MP4...\n", is_progress=False))
+                    continue
+
+                if "Deleting original file" in clean_line:
+                    continue
+
+                # --- PROGRESS BAR HANDLING ---
+                if "[download]" in clean_line:
+                    if "%" in clean_line and "of" in clean_line and "ETA" in clean_line:
+                        match = re.search(r'([\d.]+)%\s+of\s+([^\s]+)\s+at\s+([^\s]+)\s+ETA\s+([^\s]+)', clean_line)
+                        if match:
+                            pct_str, total_str, speed_str, eta_str = match.groups()
+                            try:
+                                pct = float(pct_str)
+                                total_bytes = parse_to_bytes(total_str)
+                                downloaded_bytes = total_bytes * (pct / 100.0)
+                                downloaded_str = format_size(downloaded_bytes)
+                                total_sz_str = format_size(total_bytes)
+                                speed_bytes = parse_to_bytes(speed_str.replace('/s', ''))
+                                speed_st_str = format_speed(speed_bytes)
+                                
+                                bar_len = 15
+                                filled = int(pct / 100 * bar_len)
+                                bar = f"Downloading {stream_type} [ {'|' * filled}{' ' * (bar_len - filled)} ] {pct:.1f}% | {downloaded_str}/{total_sz_str} | {speed_st_str} | ETA {eta_str}"
+                                
+                                self.after(0, lambda b=bar: self.append_or_update_progress(b, is_progress=True))
+                                continue
+                            except Exception:
+                                pass
+                    continue
+                
+                self.after(0, lambda l=clean_line: self.append_or_update_progress(l + "\n", is_progress=False))
                 
             process.wait()
-            self.after(0, lambda: self.append_output("\n[Process Finished]\n"))
+            self.after(0, lambda: self.append_or_update_progress("\n[Process Finished]\n", is_progress=False))
             
         except Exception as e:
-            self.after(0, lambda: self.append_output(f"\nError: {str(e)}\n"))
+            self.after(0, lambda: self.append_or_update_progress(f"\nError: {str(e)}\n", is_progress=False))
 
 if __name__ == "__main__":
     app = TerminalGUI()
